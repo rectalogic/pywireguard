@@ -1,18 +1,13 @@
 import base64
 import hashlib
 import heapq
-import json
 import logging
 import os
 import selectors
 import socket
 import struct
-import subprocess
-import sys
 import time
 from collections import namedtuple
-from ctypes import Structure, c_char, c_short, c_int
-from fcntl import ioctl
 from typing import Callable
 
 from cryptography.exceptions import InvalidTag, InvalidSignature, InvalidKey
@@ -276,10 +271,8 @@ class WgHandshake:
 
 
 class WgPeer:
-    def __init__(self, ip: str, endpoint: tuple[str, int], public: bytes, node: 'WgNode', psk: bytes):
-        self.logger = logging.getLogger(f'wg.{ip}')
-        self.ip = ip
-        self.ip_bytes = socket.inet_aton(ip)  # for fast comparison with dst address in ip packet
+    def __init__(self, endpoint: tuple[str, int], public: bytes, node: 'WgNode', psk: bytes):
+        self.logger = logging.getLogger(f'wg.{endpoint}')
         self.endpoint = endpoint
         self.public = public
         self.node = node
@@ -369,153 +362,29 @@ class WgPeer:
             self.keep_alive_timer = timer.schedule(KEEPALIVE_TIMEOUT, KEEPALIVE_TIMEOUT, self._send_keepalive)
 
 
-# include/uapi/linux/if_tun.h
-# define TUNSETIFF     _IOW('T', 202, int)
-TUNSETIFF = 0x400454ca
-TUNSETOWNER = TUNSETIFF + 2
-IFF_TUN = 0x0001
-IFF_NO_PI = 0x1000
-
-# for macos
-CTLIOCGINFO = 0xc0644e03
-
-
-class IfReq(Structure):
-    _fields_ = [("name", c_char * 16), ("flags", c_short)]
-
-
-class CtlInfo(Structure):
-    _fields_ = [
-        ("ctl_id", c_int),
-        ("ctl_name", c_char * 96)
-    ]
-
-
-class LinuxTunReaderWriter:
-    def __init__(self, fd: int):
-        self.fd = fd
-        self.buf = memoryview(bytearray(65535))
-
-    def fileno(self):
-        return self.fd
-
-    def read(self):
-        n = os.readv(self.fd, [self.buf])
-        padding_size = 0
-        if n % 16 != 0:
-            padding_size = 16 - n % 16    # padding for ChaCha20Poly1305 encryption
-        return self.buf[:n+padding_size]
-
-    def write(self, data: bytes):
-        os.write(self.fd, data)
-
-
-class DarwinTunReaderWriter:
-    def __init__(self, sock: socket.socket):
-        self.sock = sock
-        self.fd = sock.fileno()
-        self.buf = memoryview(bytearray(65535))
-
-    def fileno(self):
-        return self.fd
-
-    def read(self):
-        n = os.readv(self.fd, [self.buf])
-        ip_packet_size = n - 4  # darwin has no IFF_NO_PI, so we have to strip the 4-byte header
-        padding_size = 0
-        if ip_packet_size % 16 != 0:
-            padding_size = 16 - ip_packet_size % 16 # padding for ChaCha20Poly1305 encryption
-        return self.buf[4:n+padding_size]
-
-    def write(self, data: bytes):
-        header = b'\x00\x00\x00\x02'  # darwin has no IFF_NO_PI, so we have to insert the 4-byte header
-        os.writev(self.fd, [header, data])
-
-
 class WgNode:
-    def __init__(self, ip: str, listen_ip: str, listen_port: int, private: bytes, public: bytes, peers: list[WgPeer]):
-        self.ip = ip
+    def __init__(self, listen_ip: str = '0.0.0.0', listen_port: int = 9000, private_password: str = 'test'):
         self.listen_ip, self.listen_port = listen_ip, listen_port
-        self.tun = None
         self.sock: socket.socket = None
         self.sock_write_queue: list[tuple[bytes, tuple[str, int]]] = []
-        self.private = private
-        self.public = public
+        self.private = hashlib.blake2s(private_password.encode()).digest()
+        self.public = dh_public(self.private)
         self.mac1_auth = hash(LABEL_MAC1 + self.public)
-        self.peers = peers
-
-    @classmethod
-    def from_json(cls, json_file: str = 'wg.json') -> 'WgNode':
-        with open(json_file) as f:
-            conf = json.load(f)
-            ip = conf['ip']
-            listen_ip = conf.get('listen_ip', '0.0.0.0')
-            listen_port = conf.get('listen_port', 0)
-            private = base64.b64decode(conf['private'])
-            public = dh_public(private)
-            peers = []
-            node = cls(ip, listen_ip, listen_port, private, public, peers)
-            for peer in conf['peers']:
-                peer_ip = peer['ip']
-                peer_public = base64.b64decode(peer['public'])
-                endpoint = peer.get('endpoint', '')
-                if endpoint:
-                    ip, port = endpoint.split(':')
-                    peer_endpoint = (ip, int(port))
-                else:
-                    peer_endpoint = ('', 0)
-                pre_shared_key = peer.get('pre_shared_key')
-                if pre_shared_key:
-                    psk = base64.b64decode(pre_shared_key)
-                else:
-                    psk = b'\x00' * 32
-                peers.append(WgPeer(peer_ip, peer_endpoint, peer_public, node=node, psk=psk))
-            return node
+        self.peers: list[WgPeer] = []
+        logger.info('Listening on %s:%d PublicKey: %s', listen_ip, listen_port, base64.b64encode(self.public).decode())
 
     def _setup_udp_sock(self):
         self.sock: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.listen_ip, self.listen_port))
 
-    def _setup_tun_dev(self):
-        """create a linux tun device and return it"""
-        if sys.platform == 'linux':
-            tun = os.open("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC)
-            # struct.pack an instance of ifreq with setting ifrn_name
-            req = IfReq(name='testun%d'.encode(), flags=IFF_TUN | IFF_NO_PI)
-            ioctl(tun, TUNSETIFF, req)
-            ioctl(tun, TUNSETOWNER, os.getuid())
-            ifname = req.name.decode()
-            subprocess.check_call(f'ip addr add {self.ip}/24 dev {ifname}', shell=True)
-            subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
-            for peer in self.peers:
-                subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
-            self.tun = LinuxTunReaderWriter(tun)
-        elif sys.platform == 'darwin':
-            sock = socket.socket(socket.AF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL)
-            ctl_info = CtlInfo()
-            ctl_info.ctl_id = 0
-            ctl_info.ctl_name = b"com.apple.net.utun_control"
-            ioctl(sock.fileno(), CTLIOCGINFO, ctl_info)
-            sock.connect((ctl_info.ctl_id, 0))
-            interface_name = sock.getsockopt(socket.SYSPROTO_CONTROL, 2, 16).rstrip(b'\x00').decode()
-            subprocess.check_call(f'ifconfig {interface_name} inet {self.ip}/24 {self.ip} alias up', shell=True)
-            for peer in self.peers:
-                subprocess.check_call(f'route -n add -net {peer.ip} {self.ip}', shell=True)
-            self.tun = DarwinTunReaderWriter(sock)
-        else:
-            raise NotImplementedError(f'platform {sys.platform} not supported')
-
     def _setup_selector(self):
-        os.set_blocking(self.tun.fileno(), False)
         self.sock.setblocking(False)
         selector = selectors.DefaultSelector()
         selector.register(self.sock, selectors.EVENT_READ)
-        selector.register(self.tun, selectors.EVENT_READ)
         return selector
 
     def serve(self):
         self._setup_udp_sock()
-        self._setup_tun_dev()
         selector = self._setup_selector()
         while True:
             next_tick = timer.next_tick()
@@ -529,20 +398,11 @@ class WgNode:
             events = selector.select(timeout)
             if next_tick and next_tick < time.time():
                 timer.tick()
-            udp_ready = tun_ready = False
+            udp_ready = False
             for key, mask in events:
-                if key.fileobj is self.tun:
-                    tun_ready = True
-                elif key.fileobj is self.sock:
+                if key.fileobj is self.sock:
                     udp_ready = True
-            while tun_ready or udp_ready or self.sock_write_queue:
-                if tun_ready:
-                    try:
-                        ip_packet = self.tun.read()
-                    except BlockingIOError:
-                        tun_ready = False
-                    else:
-                        self.on_tun_read(ip_packet)
+            while udp_ready or self.sock_write_queue:
                 if udp_ready:
                     try:
                         data, addr = self.sock.recvfrom(65535)
@@ -557,19 +417,6 @@ class WgNode:
                         self.sock_write_queue.pop(0)
                     except BlockingIOError:
                         pass
-
-    def on_tun_read(self, ip_packet: bytes | memoryview):
-        """called when data read from tun(aka. ip packets to encapsulate in udp)"""
-        # check if data is a valid ip packet
-        if len(ip_packet) < 20:
-            return
-        # support ipv4 only for now
-        version = ip_packet[0] >> 4
-        if version != 4:
-            return
-        dst_addr = ip_packet[16:20]
-        if peer := self.get_peer(ip=dst_addr):
-            peer.send_data(ip_packet)
 
     def on_udp_read(self, data: bytes, addr: tuple[str, int]):
         """called when data read from udp(aka. wireguard handshake messages or encrypted ip packets)"""
@@ -607,7 +454,6 @@ class WgNode:
                 if decrypted := peer.decrypt_data(message):
                     peer.last_addr = addr
                     peer.last_received_time = time.time()
-                    self.tun.write(decrypted)
 
     def init_handshake(self, peer: WgPeer) -> WgHandshake:
         """called by initiator: initiate a wireguard handshake with responder's public key.
@@ -676,8 +522,9 @@ class WgNode:
         peer = self.get_peer(peer_public=si_pub)
 
         if not peer:
-            logger.warning('handshake init from %s have no corresponding peer', addr)
-            return
+            logger.warning('handshake init from %s - adding peer', addr)
+            peer = WgPeer(addr, si_pub, node=self, psk=b'\x00' * 32)
+            self.peers.append(peer)
         if peer.cur_session and time.time() - peer.cur_session.establish_time < MIN_HANDSHAKE_INTERVAL:
             logger.warning('handshake init from %s is too frequent', addr)
             return
@@ -726,10 +573,10 @@ class WgNode:
         data = struct.pack(message_format, *message)
         self.sock_write_queue.append((data, addr))
 
-    def get_peer(self, ip: bytes | None = None, peer_public: bytes | None = None,
+    def get_peer(self, peer_public: bytes | None = None,
                  handshake_session_id: bytes | None = None, session_id: bytes | None = None) -> WgPeer | None:
         for peer in self.peers:
-            if peer.ip_bytes == ip or peer.public == peer_public:
+            if peer.public == peer_public:
                 return peer
             if session_id:
                 if peer.cur_session and peer.cur_session.local_id == session_id:
@@ -744,4 +591,4 @@ class WgNode:
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
-    WgNode.from_json().serve()
+    WgNode().serve()
