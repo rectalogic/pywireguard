@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.hmac import HMAC
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 logger = logging.getLogger('wg')
 
@@ -46,13 +47,13 @@ def dh(private_key: bytes, public_key: bytes) -> bytes:
 
 
 def dh_public(private_key: bytes) -> bytes:
-    return X25519PrivateKey.from_private_bytes(private_key).public_key().public_bytes_raw()
+    return X25519PrivateKey.from_private_bytes(private_key).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
 def dh_generate() -> tuple[bytes, bytes]:
     private = X25519PrivateKey.generate()
     public = private.public_key()
-    return private.private_bytes_raw(), public.public_bytes_raw()
+    return private.private_bytes_raw(), public.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
 def hmac(key: bytes, input_: bytes) -> bytes:
