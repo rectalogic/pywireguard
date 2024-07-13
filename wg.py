@@ -53,7 +53,7 @@ def dh_public(private_key: bytes) -> bytes:
 def dh_generate() -> tuple[bytes, bytes]:
     private = X25519PrivateKey.generate()
     public = private.public_key()
-    return private.private_bytes_raw(), public.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    return private.private_bytes(Encoding.Raw, PublicFormat.Raw), public.public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
 def hmac(key: bytes, input_: bytes) -> bytes:
